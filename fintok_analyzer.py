@@ -9,9 +9,16 @@ from collections import Counter
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import classification_report
+from sklearn.metrics import cohen_kappa_score
 
 
-OUTPUT_DIR = "./charts"
+
+OUTPUT_DIR = "./newcharts"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 SCAM_COLOR      = "#E05252"   
@@ -45,18 +52,62 @@ plt.rcParams.update({"font.family":       "serif",
 # Keywords
 LEXICON = {"Scarcity Language": ["limited spots", "limited time", "act now", "don't miss", "last chance",
                                 "only a few", "days till", "spots left", "hurry", "selling out",
-                                "ends soon", "while supplies last"],
+                                "ends soon", "while supplies last", "today only", "before it's gone",
+                                "final chance", "lock in", "kickstart", "looking to buy"],
         "Vague Earnings Claims": ["make money", "earn thousands", "passive income", "financial freedom",
-                                "get rich", r"make \$", r"earn \$", "income stream", "six figures",
+                                "get rich", r"make \\$", r"earn \\$", "income stream", "six figures",
                                 "7 figures", "make 6", "unlimited income", "replace your income",
-                                "quit your job", "financial independence"],
+                                "quit your job", "financial independence", "side hustle", "sidehustle",
+                                "internet money", "online money", "work from home", "online income",
+                                "daily pay", "weekly pay", "be your own boss", "easy money",
+                                "income proof", "365k", "digital product", "digital products",
+                                "dropshipping", "affiliate marketing"],
         "Recruitment Language": ["dm me", "comment below", "link in bio", "join now", "sign up",
-                                "get started", "click link", "message me", r"comment.{0,10}start",
-                                "grab your", "send me", "reach out"],
+                                "get started", "click link", "message me", r"comment.{0,15}start",
+                                "grab your", "send me", "reach out", "apply now", "join my team",
+                                "mentorship", "coaching program", "free training", "book a call",
+                                "drop a comment", "comment info", "comment yes", "comment interested",
+                                "tester", "full guide", "supply today", "top of my page",
+                                "website", "how can i get this", "guide", "course"],
         "Supplement Deception": ["weight loss", "metabolism", "detox", "burn fat", "supplement",
                                 "lose weight", "gut health", "cortisol", "inflammation",
                                 "skincare", "collagen", "probiotic", "natural remedy",
-                                "clinically proven", "doctor recommended"]}
+                                "clinically proven", "doctor recommended", "ozempic", "glp",
+                                "hormone", "belly fat", "bloat", "cleanse", "plateau",
+                                "booster", "fasting", "root", "moto", "viral products",
+                                "before after", "before/after", "transformation", "results guaranteed"],
+        "Credibility / Proof Language": ["proof", "testimonial", "results", "guaranteed", "verified",
+                                "trusted", "secret", "method", "system", "blueprint",
+                                "step-by-step", "step by step", "changed my life",
+                                "authorized distributor", "stan.store", "creator claims"],
+        "Risk-Hiding Language": ["not financial advice", "do your own research", "no risk",
+                                "risk free", "safe", "guaranteed results", "works for everyone",
+                                "false claim", "misleading", "too good to be true"]}
+
+CATEGORY_WEIGHTS = {"Scarcity Language": 1,
+                    "Vague Earnings Claims": 1,
+                    "Recruitment Language": 2,
+                    "Supplement Deception": 2,
+                    "Credibility / Proof Language": 1,
+                    "Risk-Hiding Language": 2}
+
+COMMENT_FLAGS = ["scam", "fake", "is this real", "not real", "lying",
+                 "does this work", "did anyone try", "waste of money",
+                 "too good to be true", "proof", "receipt", "website",
+                 "how can i get", "link in bio", "doesn't work"]
+
+CATEGORY_SPECIFIC_KEYWORDS = {"Financial": ["forex", "crypto", "trading", "investment", "invest",
+                                             "profit", "portfolio", "signals", "trading group",
+                                             "copy my trades", "funded account", "kalshi", "freecash",
+                                             "money", "cash", "side hustle", "online business"],
+                              "Health": ["ozempic", "detox", "weight loss", "belly fat",
+                                         "gut health", "cortisol", "hormone", "cleanse",
+                                         "supplement", "natural remedy", "metabolism", "booster",
+                                         "root", "moto", "plateau", "fasting", "lbs"],
+                              "Lifestyle": ["glow up", "dropshipping", "digital product",
+                                            "digital products", "affiliate marketing", "course", "coaching",
+                                            "work from home", "laptop lifestyle", "guide", "tester",
+                                            "niche", "pricing", "online business"]}
 
 
 # Loading Data
@@ -76,18 +127,21 @@ def load_data():
     return combined, financial, health, lifestyle
 
 
+def combine_text_fields(df):
+    df = df.copy()
+
+    for col in ["Caption", "Top Comments", "Primary Hashtag"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["all_text"] = (df["Caption"].fillna("").astype(str) + " " +
+                      df["Top Comments"].fillna("").astype(str) + " " +
+                      df["Primary Hashtag"].fillna("").astype(str))
+
+    return df
+
 
 def score_post(caption_text):
-    """
-    For a single post's caption, checks whether it contains any keywords from each of the four scam lexicon categories
-
-    Returns a dictionary like:
-        {"Scarcity Language":       1,   
-        "Vague Earnings Claims":   0,   
-        "Recruitment Language":    1,
-        "Supplement Deception":    0}
-    """
-
     caption_lowercase = str(caption_text).lower()
     category_hit_flags = {}
 
@@ -104,31 +158,62 @@ def score_post(caption_text):
     return category_hit_flags
 
 
-def classify(caption_text, min_categories_hit=1):
-    """
-    Decide whether a post is a scam based on how many lexicon categories it triggers
+def comment_suspicion_score(comment_text):
+    comment_lowercase = str(comment_text).lower()
+    score = 0
 
-    A post is flagged as a scam if it hits keywords from at least 'min_categories_hit' different categories.
+    for phrase in COMMENT_FLAGS:
+        if phrase in comment_lowercase:
+            score += 1
 
-    - min_categories_hit = 1 (default): flag if ANY category matched
-    - min_categories_hit = 2: flag only if TWO or more categories matched (stricter, fewer false positives but also fewer true positives)
-    """
-    hit_flags_per_category = score_post(caption_text)
+    return score
 
-    # Count how many categories had at least one keyword match
-    number_of_categories_hit = sum(hit_flags_per_category.values())
 
-    if number_of_categories_hit >= min_categories_hit:
+def category_specific_score(row):
+    category = row["category"]
+    text = str(row["all_text"]).lower()
+    score = 0
+
+    for phrase in CATEGORY_SPECIFIC_KEYWORDS.get(category, []):
+        if phrase in text:
+            score += 1
+
+    return score
+
+
+def classify(text, min_score=2):
+    hit_flags_per_category = score_post(text)
+
+    total_score = 0
+    for category_name, hit in hit_flags_per_category.items():
+        if hit == 1:
+            total_score += CATEGORY_WEIGHTS.get(category_name, 1)
+
+    if total_score >= min_score:
+        return "yes"
+    else:
+        return "no"
+
+
+def classify_row(row, min_score=2):
+    text = row["all_text"]
+    hit_flags_per_category = score_post(text)
+
+    total_score = 0
+    for category_name, hit in hit_flags_per_category.items():
+        if hit == 1:
+            total_score += CATEGORY_WEIGHTS.get(category_name, 1)
+
+    total_score += comment_suspicion_score(row.get("Top Comments", ""))
+    total_score += category_specific_score(row)
+
+    if total_score >= min_score:
         return "yes"
     else:
         return "no"
 
 
 def keyword_hit_rates(list_of_captions):
-    """
-    Given a list/series of captions, calculate what percentage of them contain at least one keyword from each lexicon category
-    """
-
     total_number_of_captions = len(list_of_captions)
     hit_rate_per_category = {}
 
@@ -205,8 +290,9 @@ def fig1_scam_rate_by_category(combined):
 
 
 def fig2_keyword_category_hits(combined: pd.DataFrame):
-    scam_caps  = combined[combined["Scam_clean"] == "yes"]["Caption"].dropna()
-    legit_caps = combined[combined["Scam_clean"] == "no"]["Caption"].dropna()
+    text_column = "all_text" if "all_text" in combined.columns else "Caption"
+    scam_caps  = combined[combined["Scam_clean"] == "yes"][text_column].dropna()
+    legit_caps = combined[combined["Scam_clean"] == "no"][text_column].dropna()
 
     scam_rates  = keyword_hit_rates(scam_caps)
     legit_rates = keyword_hit_rates(legit_caps)
@@ -217,7 +303,7 @@ def fig2_keyword_category_hits(combined: pd.DataFrame):
 
     x     = range(len(cats))
     width = 0.35
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig, ax = plt.subplots(figsize=(10, 4.8))
 
     b1 = ax.bar([i - width/2 for i in x], s_vals, width, label="Scam posts",
                 color=SCAM_COLOR, alpha=0.88)
@@ -230,7 +316,8 @@ def fig2_keyword_category_hits(combined: pd.DataFrame):
             ax.text(bar.get_x() + bar.get_width()/2, h + 0.3, f"{h:.1f}%",
                     ha="center", va="bottom", fontsize=8)
 
-    short_labels = ["Scarcity\nlanguage", "Vague\nearnings", "Recruitment\nlanguage", "Supplement\ndeception"]
+    short_labels = ["Scarcity\nlanguage", "Vague\nearnings", "Recruitment\nlanguage",
+                    "Supplement\ndeception", "Credibility/\nproof", "Risk-hiding\nlanguage"]
     ax.set_xticks(list(x))
     ax.set_xticklabels(short_labels)
     ax.set_ylabel("Posts containing category keyword (%)")
@@ -242,9 +329,9 @@ def fig2_keyword_category_hits(combined: pd.DataFrame):
     plt.savefig(path)
     plt.close()
 
-def fig3_confusion_matrix(combined: pd.DataFrame):
+def fig3_confusion_matrix(combined: pd.DataFrame, min_score=2):
     combined = combined.copy()
-    combined["predicted"] = combined["Caption"].apply(lambda x: classify(x, min_categories_hit=1))
+    combined["predicted"] = combined.apply(lambda row: classify_row(row, min_score=min_score), axis=1)
     y_true = (combined["Scam_clean"] == "yes").astype(int)
     y_pred = (combined["predicted"]  == "yes").astype(int)
     cm     = confusion_matrix(y_true, y_pred)
@@ -261,24 +348,19 @@ def fig3_confusion_matrix(combined: pd.DataFrame):
 
     fig, ax = plt.subplots(figsize=(6, 5))
 
-    sns.heatmap(
-        color_matrix,
-        annot=cell_labels, fmt="",
-        cmap=LinearSegmentedColormap.from_list("cmap", ["#52A882", "#E05252"]),
-        vmin=0, vmax=1,
-        xticklabels=["Predicted: Legit", "Predicted: Scam"],
-        yticklabels=["Actual: Legit",    "Actual: Scam"],
-        ax=ax, linewidths=3, linecolor="white",
-        cbar=False, annot_kws={"size": 13, "color": "white", "fontweight": "bold"})
+    sns.heatmap(color_matrix,
+                annot=cell_labels, fmt="",
+                cmap=LinearSegmentedColormap.from_list("cmap", ["#52A882", "#E05252"]),
+                vmin=0, vmax=1,
+                xticklabels=["Predicted: Legit", "Predicted: Scam"],
+                yticklabels=["Actual: Legit",    "Actual: Scam"],
+                ax=ax, linewidths=3, linecolor="white",
+                cbar=False, annot_kws={"size": 13, "color": "white", "fontweight": "bold"})
 
-    ax.set_title(
-        "Keyword classifier — confusion matrix\n(threshold ≥1 category, n = 300)",
-        fontsize=11, pad=14, color="#2D2D2D")
+    ax.set_title(f"Keyword classifier — confusion matrix\n(weighted score ≥{min_score}, n = 400)", fontsize=11, pad=14, color="#2D2D2D")
     ax.tick_params(length=0, labelsize=10)
 
-    fig.text(
-        0.5, 0.01,
-        f"Precision: {p:.2f}   |   Recall: {r:.2f}   |   F1: {f1:.2f}",
+    fig.text(0.5, 0.01, f"Precision: {p:.2f}   |   Recall: {r:.2f}   |   F1: {f1:.2f}",
         ha="center", fontsize=9, color="#555555", fontstyle="italic")
 
     plt.tight_layout(rect=[0, 0.05, 1, 1])
@@ -288,8 +370,9 @@ def fig3_confusion_matrix(combined: pd.DataFrame):
 
 
 def fig4_evasion_tactics(combined: pd.DataFrame):
-    scam_posts  = combined[combined["Scam_clean"] == "yes"]["Caption"].dropna()
-    legit_posts = combined[combined["Scam_clean"] == "no"]["Caption"].dropna()
+    text_column = "all_text" if "all_text" in combined.columns else "Caption"
+    scam_posts  = combined[combined["Scam_clean"] == "yes"][text_column].dropna()
+    legit_posts = combined[combined["Scam_clean"] == "no"][text_column].dropna()
 
     tactic_names = list(detect_evasion("dummy").keys())
 
@@ -331,8 +414,82 @@ def fig4_evasion_tactics(combined: pd.DataFrame):
     plt.close()
 
 
+def test_thresholds(combined: pd.DataFrame):
+    print("\nTHRESHOLD TESTING")
+    print("Score | Precision | Recall | F1")
 
-def print_summary(combined: pd.DataFrame):
+    y_true = (combined["Scam_clean"] == "yes").astype(int)
+
+    for score in [1, 2, 3, 4, 5, 6]:
+        preds = combined.apply(lambda row: classify_row(row, min_score=score), axis=1)
+        y_pred = (preds == "yes").astype(int)
+
+        p = precision_score(y_true, y_pred, zero_division=0)
+        r = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+
+        print(f"{score:5d} | {p:.3f}     | {r:.3f}  | {f1:.3f}")
+
+
+def show_errors(combined: pd.DataFrame, min_score=2):
+    combined = combined.copy()
+    combined["predicted"] = combined.apply(lambda row: classify_row(row, min_score=min_score), axis=1)
+
+    false_negatives = combined[(combined["Scam_clean"] == "yes") & (combined["predicted"] == "no")]
+    false_positives = combined[(combined["Scam_clean"] == "no") & (combined["predicted"] == "yes")]
+
+    false_negatives.to_csv("false_negatives_to_review.csv", index=False)
+    false_positives.to_csv("false_positives_to_review.csv", index=False)
+
+    print(f"\nSaved {len(false_negatives)} false negatives to review.")
+    print(f"Saved {len(false_positives)} false positives to review.")
+
+
+def run_tfidf_logistic_regression(combined: pd.DataFrame):
+    X = combined["all_text"].fillna("")
+    y = (combined["Scam_clean"] == "yes").astype(int)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25,
+                                                        random_state=42, stratify=y)
+
+    model = Pipeline([("tfidf", TfidfVectorizer(lowercase=True,
+                                                ngram_range=(1, 2),
+                                                min_df=2,
+                                                max_df=0.90)),
+                      ("logreg", LogisticRegression(max_iter=1000,
+                                                    class_weight="balanced"))])
+
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    print("\nTF-IDF + Logistic Regression Results")
+    print(classification_report(y_test, y_pred, target_names=["Legit", "Scam"], zero_division=0))
+
+
+import pandas as pd
+from sklearn.metrics import cohen_kappa_score
+
+def compute_kappa_from_file():
+    df = pd.read_csv("Cohen's Kappa.csv")  
+    df["Scam_clean"] = df["Scam?"].astype(str).str.strip().str.lower()
+    df["Second_clean"] = df["Second Label"].astype(str).str.strip().str.lower()
+
+    df = df[df["Scam_clean"].isin(["yes", "no"]) & df["Second_clean"].isin(["yes", "no"])]
+
+    kappa = cohen_kappa_score(df["Scam_clean"], df["Second_clean"])
+
+    print("\nCOHEN'S KAPPA RESULTS")
+    print(f"Number of posts: {len(df)}")
+    print(f"Cohen's kappa: {kappa:.3f}")
+
+    disagreements = df[df["Scam_clean"] != df["Second_clean"]]
+    print(f"Disagreements: {len(disagreements)}")
+
+    disagreements.to_csv("kappa_disagreements.csv", index=False)
+    print("Saved disagreements to kappa_disagreements.csv")
+
+
+def print_summary(combined: pd.DataFrame, min_score=2):
     print("FINTOKFRAUD — SUMMARY STATISTICS\n")
 
     total = len(combined)
@@ -349,7 +506,7 @@ def print_summary(combined: pd.DataFrame):
 
     # Classifier metrics
     combined = combined.copy()
-    combined["predicted"] = combined["Caption"].apply(lambda x: classify(x, min_categories_hit=1))
+    combined["predicted"] = combined.apply(lambda row: classify_row(row, min_score=min_score), axis=1)
     y_true = (combined["Scam_clean"] == "yes").astype(int)
     y_pred = (combined["predicted"]  == "yes").astype(int)
 
@@ -358,7 +515,7 @@ def print_summary(combined: pd.DataFrame):
     f1 = f1_score(y_true, y_pred, zero_division=0)
     cm = confusion_matrix(y_true, y_pred)
 
-    print(f"\nKeyword classifier (threshold ≥1 category):")
+    print(f"\nKeyword classifier (weighted score ≥{min_score}):")
     print(f"  Precision: {p:.3f}")
     print(f"  Recall:    {r:.3f}")
     print(f"  F1 Score:  {f1:.3f}")
@@ -372,15 +529,23 @@ def print_summary(combined: pd.DataFrame):
 def main():
     print("Loading data...")
     combined, financial, health, lifestyle = load_data()
+    combined = combine_text_fields(combined)
 
-    print_summary(combined)
+    chosen_score = 2
+
+    print_summary(combined, min_score=chosen_score)
+    test_thresholds(combined)
+    show_errors(combined, min_score=chosen_score)
+    run_tfidf_logistic_regression(combined)
+    compute_kappa_from_file()
 
     print("\nGenerating charts...")
     fig1_scam_rate_by_category(combined)
     fig2_keyword_category_hits(combined)
-    fig3_confusion_matrix(combined)
+    fig3_confusion_matrix(combined, min_score=chosen_score)
     fig4_evasion_tactics(combined)
 
     print(f"\nDone!")
 
 main()
+
